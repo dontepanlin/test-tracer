@@ -1,0 +1,64 @@
+# Example scenario topology for test-tracer.
+#
+# Netlab builds this topology (linux containers for the servers, an EOS
+# router in the middle) and applies native `tc` link impairment on
+# mongo1-router. The `scenario:` block tells the scenario runner what to
+# capture and which traffic playbooks to run.
+#
+# Run with:
+#
+#     scenario -t example/topology.yml -p clab
+#
+name: scenario-ex
+provider: clab
+defaults:
+  device: linux
+  group: test-group
+  mgmt_base: 192.0.2
+  mgmt_prefix: 24
+  mgmt_mode: static
+  addressing:
+    v4_pool: 10.1.0.0/24
+  # Declare the custom top-level `scenario` attribute so netlab accepts it.
+  attributes:
+    global:
+      scenario: { type: dict }
+
+nodes:
+  mongo1: { device: linux }
+  mongo2: { device: linux }
+  bt-seed: { device: linux }
+  router: { device: eos }
+
+links:
+  # Bad WAN link: 50 ms delay, 2% loss (applied by netlab up via tc)
+  - interfaces: [ mongo1, router ]
+    tc: { delay: 50, loss: 2 }
+  - interfaces: [ mongo2, router ]
+  - interfaces: [ bt-seed, router ]
+
+scenario:
+  name: mongodb_bittorrent_test
+  results: results
+
+  # Wait for routing / BGP to converge before validating and generating traffic
+  verify:
+    - wait: 30
+
+  capture:
+    - node: mongo1
+      interface: eth1
+      filter: "port 27017"
+      output: mongo_sync.pcap
+    - node: bt-seed
+      interface: eth1
+      output: bittorrent.pcap
+
+  # Traffic generators run against the netlab-generated hosts.yml inventory.
+  # Playbooks live in example/playbooks/ and are referenced relative to the
+  # lab directory, or drop your own next to the topology file.
+  scripts:
+    - playbook: mongo_sync.yml
+      wait_after: 10
+    - playbook: seed_torrent.yml
+      wait_after: 10

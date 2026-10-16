@@ -1,0 +1,29 @@
+---
+# Example traffic generator: BitTorrent-style traffic.
+#
+# bt-seed acts as a seed and pushes a data stream to bt-leech over the
+# default torrent port (6881, libtorrent) -- adjust the port to match your
+# actual torrent setup. The capture on bt-seed/eth1 will record this.
+#
+# Replace with a real torrent client (e.g. a libtorrent seed node) as needed.
+
+- name: Generate BitTorrent-style seed traffic
+  hosts: bt-seed
+  gather_facts: false
+  vars:
+    peer_host: "{{ hostvars['mongo2'].ansible_host }}"
+  tasks:
+    - name: Push ~500 KB of data to the leech peer on port 6881 (background, 30s)
+      ansible.builtin.shell: >
+        setsid nohup python3 -c '
+        import socket, os, time
+        s = socket.create_connection(("{{ peer_host }}", 6881), timeout=10)
+        chunk = os.urandom(8192)
+        start = time.time()
+        while time.time() - start < 30:
+            s.sendall(chunk)
+        s.close()
+        ' >/tmp/bt_seed.log 2>&1 < /dev/null < /dev/null &
+        echo started
+      register: _
+      changed_when: true

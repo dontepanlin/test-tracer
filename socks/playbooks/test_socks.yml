@@ -1,0 +1,138 @@
+---
+# Test website access through the SOCKS5 proxy (plan_socks.md steps 6-7).
+#
+# 1. curl https://example.com/ through socks5h://socks-proxy:1080  -> must SUCCEED
+# 2. stop the proxy, repeat the same request                          -> must FAIL
+# 3. restart the proxy so the lab is left in a working state
+#
+# The full curl -v output is saved to /var/log/socks_test.log on the client
+# and fetched into results/ for inspection (together with go_socks5.log from
+# the proxy).
+#
+# NOTE: curl is run with its stdout/stderr redirected to a temp file (not
+# piped) so that its real exit code is preserved for the assertions.
+
+- name: Test SOCKS5 proxy end-to-end
+  hosts: socks-client
+  gather_facts: false
+  vars:
+    # netlab exports per-node data as host vars; depending on the
+    # ansible-core version it is either nested under `topology` or merged
+    # into the host root. Support both.
+    proxy_topo: "{{ hostvars['socks-proxy'].get('topology', {'interfaces': hostvars['socks-proxy'].get('interfaces', [])}) }}"
+    proxy_host: "{{ proxy_topo.interfaces[0].ipv4.split('/')[0] }}"
+    proxy_port: 1080
+    target: "https://example.com/"
+    test_log: /var/log/socks_test.log
+
+  tasks:
+    # Bootstrap python3 (needed by Ansible modules) plus curl via `raw`.
+    # modules) plus curl via `raw`.
+    - name: Bootstrap python3 and install curl, ca-certificates, procps
+      ansible.builtin.raw: >
+        (apt-get update -qq &&
+         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq
+         python3 curl ca-certificates procps)
+        >/tmp/apt_bootstrap.log 2>&1
+      register: apt
+      changed_when: apt.rc == 0
+
+    # Ensure the LAN interface has its netlab address (same reasoning as in
+    # setup_proxy.yml).
+    - name: Ensure eth1 is up with the netlab-assigned address
+      ansible.builtin.raw: |
+        ip addr replace {{ (topology | default({'interfaces': interfaces | default([])})).interfaces[0].ipv4 }} dev eth1
+        ip link set dev eth1 up
+        ip addr show eth1
+
+    # ---------------------------------------------------------------- positive
+    - name: "TEST 1: curl {{ target }} through the SOCKS proxy"
+      ansible.builtin.shell: |
+        : > {{ test_log }}
+        echo "=== curl --proxy socks5h://{{ proxy_host }}:{{ proxy_port }} {{ target }} ===" >> {{ test_log }}
+        curl --verbose \
+          --noproxy "" \
+          --proxy socks5h://{{ proxy_host }}:{{ proxy_port }} \
+          --connect-timeout 10 \
+          --max-time 30 \
+          {{ target }} >/tmp/curl1.out 2>&1
+        rc=$?
+        cat /tmp/curl1.out
+        echo "=== exit code: $rc ===" >> {{ test_log }}
+        cat /tmp/curl1.out >> {{ test_log }}
+        exit $rc
+      register: curl_ok
+      changed_when: false
+
+    - name: Verify the proxied request succeeded
+      ansible.builtin.assert:
+        that:
+          - curl_ok.rc == 0
+          - "'HTTP/2 200' in curl_ok.stdout or 'HTTP/1.1 200' in curl_ok.stdout"
+        fail_msg: |
+          Proxied curl failed. Last lines:
+          {{ curl_ok.stdout_lines[-15:] | default([]) | to_nice_yaml }}
+
+    # ---------------------------------------------------------------- negative
+    - name: Stop go-socks5-proxy on the proxy
+      delegate_to: socks-proxy
+      ansible.builtin.raw: |
+        pkill -x go-socks5-proxy 2>/dev/null || true
+        sleep 1
+        ss -lnt 'sport = :{{ proxy_port }}' | grep -q LISTEN && echo "still listening" || echo "stopped"
+      register: proxy_stop
+      changed_when: "'stopped' in proxy_stop.stdout"
+
+    - name: "TEST 2: same curl request with the proxy stopped (must FAIL)"
+      ansible.builtin.shell: |
+        {
+          echo "=== curl (proxy stopped) socks5h://{{ proxy_host }}:{{ proxy_port }} {{ target }} ==="
+        } >> {{ test_log }}
+        curl --verbose \
+          --noproxy "" \
+          --proxy socks5h://{{ proxy_host }}:{{ proxy_port }} \
+          --connect-timeout 10 \
+          --max-time 30 \
+          {{ target }} >/tmp/curl2.out 2>&1
+        rc=$?
+        cat /tmp/curl2.out
+        echo "=== exit code: $rc ===" >> {{ test_log }}
+        cat /tmp/curl2.out >> {{ test_log }}
+        exit $rc
+      register: curl_fail
+      # The failure IS the expected outcome; the assert below validates it.
+      failed_when: false
+      changed_when: false
+
+    - name: Verify the request failed without the proxy
+      ansible.builtin.assert:
+        that: curl_fail.rc != 0
+        fail_msg: "Request unexpectedly SUCCEEDED while the proxy was stopped"
+
+    # ---------------------------------------------------------------- restore
+    - name: Restart go-socks5-proxy on the proxy
+      delegate_to: socks-proxy
+      ansible.builtin.raw: |
+        setsid nohup /usr/local/bin/go-socks5-proxy --host {{ hostvars['socks-proxy'].get('topology', {'interfaces': hostvars['socks-proxy'].get('interfaces', [])}).interfaces[0].ipv4.split('/')[0] }} --port {{ proxy_port }} \
+          >>/var/log/go_socks5.log 2>&1 < /dev/null &
+        for i in $(seq 1 30); do
+          ss -lnt 'sport = :{{ proxy_port }}' | grep -q LISTEN && exit 0
+          sleep 1
+        done
+        echo "go-socks5-proxy did not restart"; cat /var/log/go_socks5.log
+        exit 1
+      changed_when: true
+
+    - name: Fetch the test log
+      ansible.builtin.fetch:
+        src: "{{ test_log }}"
+        dest: results/socks_test.log
+        flat: true
+
+    - name: Fetch go-socks5-proxy log from the proxy
+      delegate_to: socks-proxy
+      ansible.builtin.fetch:
+        src: /var/log/go_socks5.log
+        dest: results/go_socks5.log
+        flat: true
+      ignore_errors: true

@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# netlab generated artifacts (in the lab/topology directory)
+hosts.yml
+ansible.cfg
+group_vars/
+host_vars/
+node_files/
+netlab.snapshot.*
+netlab.scenario.topology.yml
+netlab.lock
+clab.yml
+Vagrantfile
+downloaded.yml
+
+# scenario runner output
+results/
+scenario-*/
+
+# scratch
+tmp-test/

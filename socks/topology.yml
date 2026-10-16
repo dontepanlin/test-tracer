@@ -1,0 +1,76 @@
+# SOCKS5 proxy test topology (see plan_socks.md).
+#
+# Two Debian 13 "VMs" (containerlab linux containers) on one L2 segment:
+#
+#   socks-proxy  10.10.0.10   - Dante SOCKS5 server on :1080
+#   socks-client 10.10.0.11   - runs curl through the proxy
+#
+# Containers get outbound Internet via Docker NAT (the proxy therefore has
+# working egress + DNS by default). No systemd runs inside the containers,
+# so the playbooks start danted as a plain background process.
+#
+# Run with:
+#
+#     scenario -t socks/topology.yml
+#
+# PCAPs end up in socks/results/.
+
+name: socks
+provider: clab
+defaults:
+  device: linux
+  group: test-group
+  # Unique lab ID so this lab does not collide with other netlab labs
+  # (one is already running with id 'default').
+  multilab.id: socks
+  mgmt_base: 192.0.2
+  mgmt_prefix: 24
+  mgmt_mode: static
+  # Declare the custom top-level `scenario` attribute so netlab accepts it.
+  attributes:
+    global:
+      scenario: { type: dict }
+
+nodes:
+  socks-proxy:
+    image: debian:13
+  socks-client:
+    image: debian:13
+
+# Same private network; static IPs exactly as in plan_socks.md.
+links:
+  - interfaces:
+      - node: socks-proxy
+        ipv4: 10.10.0.10/24
+      - node: socks-client
+        ipv4: 10.10.0.11/24
+    prefix: 10.10.0.0/24
+
+scenario:
+  name: socks5_proxy_test
+  results: results
+
+  verify:
+    - wait: 10   # give the interfaces a moment before validating
+
+  # Capture the SOCKS exchange on the client side (handshake + tunneled
+  # traffic to the proxy) and the proxy's outbound traffic to example.com.
+  #
+  # NOTE: the proxy egresses via its mgmt interface (eth0, Docker NAT),
+  # so the outbound capture is on eth0, while the SOCKS exchange is on the
+  # L2 segment (eth1).
+  capture:
+    - node: socks-client
+      interface: eth1
+      filter: "host 10.10.0.10 and tcp port 1080"
+      output: socks5_client.pcap
+    - node: socks-proxy
+      interface: eth0
+      filter: "tcp port 443"
+      output: socks5_proxy_outbound.pcap
+
+  scripts:
+    - playbook: playbooks/setup_proxy.yml
+      wait_after: 3
+    - playbook: playbooks/test_socks.yml
+      wait_after: 5   # let tcpdump flush before captures are stopped

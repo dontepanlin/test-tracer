@@ -1,0 +1,93 @@
+---
+# Install and start the go-socks5-proxy SOCKS5 server on socks-proxy.
+
+- name: Play 1 - Bootstrap Python (Required for standard modules)
+  hosts: socks-proxy
+  gather_facts: false
+  tasks:
+    - name: Install python3 and basic networking tools (Debian/Ubuntu or Alpine)
+      ansible.builtin.raw: |
+        set -e
+        if command -v python3 >/dev/null 2>&1; then
+          echo "ALREADY_INSTALLED"
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 iptables procps net-tools iproute2
+          echo "APT_INSTALLED"
+        elif command -v apk >/dev/null 2>&1; then
+          apk add --no-cache python3 iptables procps
+          echo "APK_INSTALLED"
+        else
+          echo "UNKNOWN_OS"
+          exit 1
+        fi
+      register: bootstrap_result
+      changed_when: "'INSTALLED' in bootstrap_result.stdout"
+
+- name: Play 2 - Configure and Run SOCKS5 Proxy (Container-compatible)
+  hosts: socks-proxy
+  gather_facts: false
+  vars:
+    # Explicitly tell Ansible where Python is located
+    ansible_python_interpreter: /usr/bin/python3
+    
+    # netlab exports per-node data as host vars
+    topo: "{{ topology | default({'interfaces': interfaces | default([]), 'mgmt': mgmt | default({})}) }}"
+    raw_ipv4: "{{ (topo.interfaces | default([]) | first | default({'ipv4': '10.10.0.10/24'})).ipv4 }}"
+    proxy_lan_ip: "{{ raw_ipv4.split('/')[0] }}"
+    proxy_port: 1080
+    allowed_client: "10.10.0.11"
+    go_socks_version: "v1.2.0"
+    go_socks_url: "https://github.com/ariadata/go-socks5-proxy/releases/download/{{ go_socks_version }}/go-socks5-proxy-linux-amd64"
+    proxy_bin: "/usr/local/bin/go-socks5-proxy"
+    proxy_log: "/var/log/go_socks5.log"
+
+  tasks:
+    - name: Ensure eth1 is up with the netlab-assigned address
+      ansible.builtin.shell: |
+        CURRENT_IP=$(ip -4 -o addr show dev eth1 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+        if [ "$CURRENT_IP" != "{{ proxy_lan_ip }}" ]; then
+          ip addr replace "{{ raw_ipv4 }}" dev eth1
+          ip link set dev eth1 up
+          echo "CHANGED"
+        else
+          echo "OK"
+        fi
+      register: ip_result
+      changed_when: "'CHANGED' in ip_result.stdout"
+
+    - name: Download go-socks5-proxy binary
+      ansible.builtin.get_url:
+        url: "{{ go_socks_url }}"
+        dest: "{{ proxy_bin }}"
+        mode: '0755'
+        timeout: 30
+
+    # REPLACED SYSTEMD WITH THIS BACKGROUND PROCESS MANAGER
+    - name: Ensure go-socks5-proxy is running in the background
+      ansible.builtin.shell: |
+        set -e
+        # Check if the specific process is already running
+        if pgrep -f "{{ proxy_bin }}.*--port {{ proxy_port }}" >/dev/null 2>&1; then
+          echo "ALREADY_RUNNING"
+        else
+          # Clean up any stale/zombie processes first
+          pkill -f "{{ proxy_bin }}" 2>/dev/null || true
+          sleep 1
+          # Start in background, detached from terminal, logging to file
+          nohup {{ proxy_bin }} --host {{ proxy_lan_ip }} --port {{ proxy_port }} >> {{ proxy_log }} 2>&1 &
+          echo "STARTED"
+        fi
+      register: start_result
+      changed_when: "'STARTED' in start_result.stdout"
+
+    - name: Restrict proxy port to the allowed test client only
+      ansible.builtin.iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ proxy_port }}"
+        source: "! {{ allowed_client }}"
+        jump: DROP
+        comment: "Drop SOCKS5 traffic from non-allowed clients"
+        state: present
+      ignore_errors: true  # Gracefully handle environments where iptables is restricted
