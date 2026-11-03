@@ -1,17 +1,20 @@
 """
-Scenario topology model.
+Scenario model.
 
-Reads the `scenario:` block from the netlab topology file and turns it into a
-structured object that the orchestrator can drive.
+A scenario is a **named-capture + step-timeline** structure that lives in the
+``scenario:`` block of a netlab topology file. It defines, in one place:
 
-Netlab validates topology attributes strictly, so a custom top-level
-`scenario:` block must be declared in `defaults.attributes.global` (see
-netlab's "Custom Attributes" documentation). :class:`LabTopology` reports
-whether that declaration is present so the orchestrator can materialize a
-normalized copy of the topology before invoking netlab.
+* **what to capture** and **how** (named :class:`Capture` definitions),
+* **when to capture** and **what traffic to generate** (the ordered
+  :class:`Step` timeline, where each step declares which captures are active
+  during it).
+
+This is the LLM-friendly form: a scenario is a small flat declarative YAML list
+of captures and steps. See ``PLAN-refactor.md`` for the design.
 """
 
 import copy
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,86 +26,251 @@ class ScenarioError(Exception):
     """Raised when the scenario definition is invalid."""
 
 
-@dataclass
-class CaptureSpec:
-    """A single packet-capture request."""
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+_VALID_ASSERT_KEYS = {
+    "rc_eq", "rc_neq", "contains", "not_contains", "regex", "lines_ge",
+}
 
+
+def _clean(value: str) -> str:
+    """Collapse a multi-line value to a single line (for embedding in a name)."""
+    return " ".join(str(value).split())
+
+
+def _safe_id(value: str, what: str) -> str:
+    """Validate that a name/id is safe to use in a filename or ansible var."""
+    if not isinstance(value, str) or not value:
+        raise ScenarioError(f"{what} must be a non-empty string: {value!r}")
+    if not _SAFE_NAME.match(value):
+        raise ScenarioError(
+            f"{what} {value!r} contains invalid characters "
+            "(allowed: letters, digits, '.', '_', '-')")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Captures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Capture:
+    """A named packet-capture definition (the *how*)."""
+
+    id: str
     node: str
-    interface: str = "eth1"
+    link: Optional[int] = None            # logical link id (resolved at runtime)
+    interface: Optional[str] = None       # explicit container ifname
     filter: Optional[str] = None          # BPF filter expression
-    output: Optional[str] = None          # local filename (default: <node>_<intf>.pcap)
-    seconds: Optional[int] = None         # capture duration (default: until harvest phase)
-    count: Optional[int] = None           # max number of packets
-    background: bool = True
+    output: Optional[str] = None          # local filename (default: <id>.pcap)
 
     def out_name(self) -> str:
         if self.output:
             return self.output
-        return f"{self.node}_{self.interface}.pcap".replace("/", "_").replace(" ", "_")
+        return f"{self.id}.pcap"
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CaptureSpec":
-        if not isinstance(data, dict) or "node" not in data:
-            raise ScenarioError(f"capture entry must be a mapping with a 'node' key: {data!r}")
+    def from_dict(cls, data: Dict[str, Any], index: int) -> "Capture":
+        where = f"capture[{index}]"
+        if not isinstance(data, dict):
+            raise ScenarioError(f"{where} must be a mapping: {data!r}")
+        cap_id = data.get("id")
+        if cap_id is None:
+            raise ScenarioError(f"{where} is missing required key 'id'")
+        cap_id = _safe_id(str(cap_id), f"{where}.id")
+        if "node" not in data:
+            raise ScenarioError(f"{where} ({cap_id}) is missing required key 'node'")
+        if "link" in data and "interface" in data:
+            raise ScenarioError(
+                f"{where} ({cap_id}) cannot have both 'link' and 'interface'")
+        if "link" not in data and "interface" not in data:
+            raise ScenarioError(
+                f"{where} ({cap_id}) needs 'link' (logical) or 'interface' "
+                f"(container ifname)")
         return cls(
+            id=cap_id,
             node=str(data["node"]),
-            interface=str(data.get("interface", "eth1")),
+            link=(int(data["link"]) if "link" in data else None),
+            interface=(str(data["interface"]) if "interface" in data else None),
             filter=data.get("filter"),
             output=data.get("output"),
-            seconds=data.get("seconds"),
-            count=data.get("count"),
-            background=bool(data.get("background", True)),
         )
 
 
-@dataclass
-class ScriptSpec:
-    """A traffic-generation step: either an Ansible playbook or a raw command."""
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
 
-    playbook: Optional[str] = None        # path to an Ansible playbook (relative to lab dir)
-    command: Optional[str] = None         # raw command executed on the controller
-    nodes: Optional[str] = None           # optional netlab node subset for the playbook
-    wait_after: Optional[int] = None      # seconds to sleep after the step
+_ACTION_KEYS = ("playbook", "shell", "raw", "command", "daemon", "daemon_kill")
+
+
+@dataclass
+class Action:
+    """A single traffic step inside a :class:`Step`'s ``do:`` list."""
+
+    playbook: Optional[str] = None        # path to an ansible playbook
+    shell: Optional[str] = None           # jinja-templated command (run on node)
+    raw: Optional[str] = None             # raw command, no remote interpreter
+    command: Optional[str] = None         # controller-side command
+    daemon: Optional[str] = None          # long-lived process, via `docker exec -d`
+    daemon_kill: Optional[str] = None     # pkill pattern for a daemon
+    node: Optional[str] = None            # target node for shell/raw/daemon
+    label: Optional[str] = None           # optional label (for the report)
+
+    @property
+    def kind(self) -> str:
+        for k in _ACTION_KEYS:
+            if getattr(self, k) is not None:
+                return k
+        raise ScenarioError(f"action has no known type: {self.__dict__!r}")
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ScriptSpec":
+    def from_dict(cls, data: Dict[str, Any], index: int) -> "Action":
+        where = f"do[{index}]"
         if not isinstance(data, dict):
-            raise ScenarioError(f"scripts entry must be a mapping: {data!r}")
-        if "playbook" in data and "command" in data:
-            raise ScenarioError("scripts entry cannot have both 'playbook' and 'command'")
-        if "playbook" not in data and "command" not in data:
-            raise ScenarioError(f"scripts entry needs a 'playbook' or 'command': {data!r}")
+            raise ScenarioError(f"{where} must be a mapping: {data!r}")
+        kinds = [k for k in _ACTION_KEYS if k in data]
+        if len(kinds) != 1:
+            raise ScenarioError(
+                f"{where} must have exactly one of "
+                f"playbook/shell/raw/command/daemon/daemon_kill, "
+                f"got {kinds or 'none'}")
+        if kinds[0] in ("daemon", "daemon_kill") and "node" not in data:
+            raise ScenarioError(f"{where} ({kinds[0]}) requires a 'node'")
         return cls(
             playbook=data.get("playbook"),
+            shell=data.get("shell"),
+            raw=data.get("raw"),
             command=data.get("command"),
-            nodes=data.get("nodes"),
-            wait_after=data.get("wait_after"),
+            daemon=data.get("daemon"),
+            daemon_kill=data.get("daemon_kill"),
+            node=data.get("node"),
+            label=data.get("label"),
         )
 
 
-@dataclass
-class ScenarioSpec:
-    """Parsed contents of the `scenario:` block."""
+# ---------------------------------------------------------------------------
+# Steps
+# ---------------------------------------------------------------------------
 
-    name: str = "scenario"
-    results_dir: str = "results"          # where PCAPs are harvested (relative to lab dir)
-    verify_wait: int = 0                  # seconds to wait for routing convergence
-    verify: List[Dict[str, Any]] = field(default_factory=list)
-    verify_pings: List[Dict[str, str]] = field(default_factory=list)
-    captures: List[CaptureSpec] = field(default_factory=list)
-    scripts: List[ScriptSpec] = field(default_factory=list)
-    teardown: Dict[str, Any] = field(default_factory=dict)
-    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+@dataclass
+class Step:
+    """One test case in the timeline (the *when* + *what*)."""
+
+    name: str
+    do: List[Action] = field(default_factory=list)
+    capture: List[str] = field(default_factory=list)   # capture ids active during this step
+    assert_: Optional[Dict[str, Any]] = None           # declarative pass/fail (YAML key: `assert`)
+    log: List[Dict[str, Any]] = field(default_factory=list)   # log entries to harvest
+
+    @property
+    def assertion(self) -> Optional[Dict[str, Any]]:
+        """The declarative pass/fail condition (YAML key `assert`)."""
+        return self.assert_
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ScenarioSpec":
+    def from_dict(cls, data: Dict[str, Any], index: int) -> "Step":
+        where = f"steps[{index}]"
+        if not isinstance(data, dict):
+            raise ScenarioError(f"{where} must be a mapping: {data!r}")
+        name = data.get("name")
+        if not name:
+            raise ScenarioError(f"{where} is missing required key 'name'")
+        name = _safe_id(str(name), f"{where}.name")
+
+        do_raw = data.get("do", [])
+        if not isinstance(do_raw, list) or not do_raw:
+            raise ScenarioError(f"{where} ({name}) needs a non-empty 'do' list")
+        do = [Action.from_dict(a, i) for i, a in enumerate(do_raw)]
+
+        cap = data.get("capture", [])
+        if not isinstance(cap, list):
+            raise ScenarioError(f"{where} ({name}).capture must be a list")
+        cap_ids = [_safe_id(str(c), f"{where} ({name}).capture") for c in cap]
+
+        assert_data = data.get("assert")
+        if assert_data is not None:
+            if not isinstance(assert_data, dict):
+                raise ScenarioError(f"{where} ({name}).assert must be a mapping")
+            bad = set(assert_data) - _VALID_ASSERT_KEYS
+            if bad:
+                raise ScenarioError(
+                    f"{where} ({name}).assert has unknown key(s): {sorted(bad)} "
+                    f"(valid: {sorted(_VALID_ASSERT_KEYS)})")
+            if "regex" in assert_data:
+                try:
+                    re.compile(assert_data["regex"])
+                except re.error as ex:
+                    raise ScenarioError(
+                        f"{where} ({name}).assert.regex is invalid: {ex}")
+
+        log = data.get("log", [])
+        if not isinstance(log, list):
+            raise ScenarioError(f"{where} ({name}).log must be a list")
+        for li, entry in enumerate(log):
+            if not isinstance(entry, dict) or "src" not in entry or "output" not in entry:
+                raise ScenarioError(
+                    f"{where} ({name}).log[{li}] needs 'src' and 'output': {entry!r}")
+            if "node" not in entry:
+                entry = dict(entry)
+                entry["node"] = None   # resolved to the step's node later
+
+        return cls(
+            name=name,
+            do=do,
+            capture=cap_ids,
+            assert_=assert_data,
+            log=[dict(e) for e in log],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Scenario
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Scenario:
+    """Parsed contents of the ``scenario:`` block."""
+
+    name: str = "scenario"
+    results_dir: str = "results"
+    verify_wait: int = 0
+    verify_pings: List[Dict[str, str]] = field(default_factory=list)
+    captures: List[Capture] = field(default_factory=list)
+    steps: List[Step] = field(default_factory=list)
+    always_capture: List[str] = field(default_factory=list)
+    raw: Dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def capture_map(self) -> Dict[str, Capture]:
+        return {c.id: c for c in self.captures}
+
+    def validate_references(self) -> None:
+        """Cross-check capture ids referenced by steps against definitions."""
+        known = set(self.capture_map())
+        for c in self.always_capture:
+            if c not in known:
+                raise ScenarioError(
+                    f"always_capture references unknown capture id {c!r}")
+        for step in self.steps:
+            for c in step.capture:
+                if c not in known:
+                    raise ScenarioError(
+                        f"step {step.name!r} references unknown capture id {c!r}")
+        # duplicate capture ids
+        ids = [c.id for c in self.captures]
+        dups = {i for i in ids if ids.count(i) > 1}
+        if dups:
+            raise ScenarioError(f"duplicate capture ids: {sorted(dups)}")
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Scenario":
         if data is None:
             data = {}
         if not isinstance(data, dict):
             raise ScenarioError(f"'scenario' must be a mapping, got {type(data).__name__}")
         spec = cls(raw=copy.deepcopy(data))
-        spec.name = str(data.get("name", "scenario"))
+        spec.name = _safe_id(str(data.get("name", "scenario")), "scenario.name")
 
+        # verify:
         verify = data.get("verify", [])
         if not isinstance(verify, list):
             raise ScenarioError("'scenario.verify' must be a list")
@@ -120,22 +288,24 @@ class ScenarioSpec:
                 if "self" in ping:
                     item["self"] = str(ping["self"])
                 spec.verify_pings.append(item)
-            spec.verify.append(entry)
 
-        for c in data.get("capture", []) or []:
-            spec.captures.append(CaptureSpec.from_dict(c))
-        for s in data.get("scripts", []) or []:
-            spec.scripts.append(ScriptSpec.from_dict(s))
+        for i, c in enumerate(data.get("captures", []) or []):
+            spec.captures.append(Capture.from_dict(c, i))
+        for i, s in enumerate(data.get("steps", []) or []):
+            spec.steps.append(Step.from_dict(s, i))
+
+        always = data.get("always_capture", [])
+        if not isinstance(always, list):
+            raise ScenarioError("'scenario.always_capture' must be a list")
+        spec.always_capture = [_safe_id(str(c), "always_capture") for c in always]
 
         if "results" in data:
             spec.results_dir = str(data["results"])
-        if "teardown" in data:
-            spec.teardown = data["teardown"] or {}
         return spec
 
 
 def declaration_present(data: Dict[str, Any]) -> bool:
-    """True if `defaults.attributes.global.scenario` is declared."""
+    """True if ``defaults.attributes.global.scenario`` is declared."""
     attrs = (data.get("defaults") or {}).get("attributes", {})
     if not isinstance(attrs, dict):
         return False
@@ -145,10 +315,10 @@ def declaration_present(data: Dict[str, Any]) -> bool:
 
 @dataclass
 class LabTopology:
-    """A netlab topology file plus its `scenario:` block."""
+    """A netlab topology file plus its ``scenario:`` block."""
 
     path: Path
-    scenario: ScenarioSpec
+    scenario: Scenario
     raw: Dict[str, Any] = field(default_factory=dict, repr=False)
     declaration_present: bool = False
 
@@ -170,11 +340,11 @@ class LabTopology:
             raise ScenarioError(f"topology {path} has no 'nodes' section")
 
         has_scenario = "scenario" in data
-        scenario = ScenarioSpec.from_dict(data.get("scenario") if has_scenario else {})
         if not has_scenario:
-            # A topology without a scenario block is valid, but not very useful;
-            # keep going so `--phase create` etc. still works, and warn in CLI.
-            pass
+            raise ScenarioError(
+                f"topology {path} has no 'scenario' block; a scenario is required")
+        scenario = Scenario.from_dict(data["scenario"])
+        scenario.validate_references()
 
         return cls(
             path=path,
@@ -189,7 +359,7 @@ class LabTopology:
         if "scenario" in data:
             attrs = data.setdefault("defaults", {}).setdefault("attributes", {})
             if not isinstance(attrs, dict):
-                raise ScenarioError("defaults.attributes.global must be a mapping")
+                raise ScenarioError("defaults.attributes must be a mapping")
             globs = attrs.setdefault("global", {})
             if not isinstance(globs, dict):
                 raise ScenarioError("defaults.attributes.global must be a mapping")

@@ -7,7 +7,11 @@ Usage examples::
     scenario -t topology.yml --phase create      # just start the lab
     scenario -t topology.yml --dry-run           # show what would run
     scenario -t topology.yml --keep-lab          # skip teardown
-    scenario -t topology.yml --phase capture,harvest   # subset of phases
+    scenario -t topology.yml --phase steps,harvest   # subset of phases
+
+    scenario describe -t topology.yml            # LLM-readable timeline
+    scenario describe -t topology.yml --format yaml
+    scenario describe -t topology.yml --format json
 """
 
 import argparse
@@ -18,8 +22,9 @@ from typing import List, Optional
 from . import __version__, console as c
 from .runner import ScenarioConfig, ScenarioRunner, ScenarioRunError
 from .scenario import LabTopology, ScenarioError
+from .describe import describe as render_describe
 
-PHASES = ["create", "verify", "capture", "harvest", "teardown"]
+PHASES = ["create", "verify", "steps", "harvest", "teardown"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,21 +32,56 @@ def build_parser() -> argparse.ArgumentParser:
         prog="scenario",
         description=(
             "Run a network scenario: netlab builds the topology (with native "
-            "tc), Ansible drives captures and traffic, PCAPs are harvested. "
-            "Lifecycle: create -> tc -> verify -> capture/scripts -> harvest "
-            "-> teardown"),
+            "tc), Ansible drives the step timeline (captures + traffic + "
+            "asserts), PCAPs are harvested. "
+            "Lifecycle: create -> verify -> steps -> harvest -> teardown"
+        ),
     )
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="command")
+
+    # --- run (default) ---
+    run_p = sub.add_parser("run", help="Run the scenario lifecycle (default)")
+    _add_run_args(run_p)
+
+    # --- describe ---
+    desc_p = sub.add_parser(
+        "describe",
+        help="Print the parsed scenario as a readable, LLM-friendly timeline",
+    )
+    desc_p.add_argument(
         "-t", "--topology",
         default="topology.yml",
         help="Path to the netlab topology file (default: topology.yml)",
     )
+    desc_p.add_argument(
+        "--format",
+        choices=["text", "yaml", "json"],
+        default="text",
+        help="Output format (default: text)",
+    )
+
+    # --- top-level (so `scenario -t ...` works without a subcommand) ---
+    _add_run_args(parser)
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def _add_run_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "-t", "--topology",
+        default="topology.yml",
+        help="Path to the netlab topology file (default: topology.yml)",
+    )
+    p.add_argument(
         "-p", "--provider",
         default=None,
         help="Virtualization provider override (e.g. clab, libvirt, vagrant)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--phase",
         default=None,
         help=(
@@ -49,34 +89,28 @@ def build_parser() -> argparse.ArgumentParser:
             f"Valid: {', '.join(PHASES)}"
         ),
     )
-    parser.add_argument(
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the commands that would be executed, but do not execute them",
+        help="Print the planned timeline and commands, but do not execute them",
     )
-    parser.add_argument(
+    p.add_argument(
         "--keep-lab",
         action="store_true",
         help="Skip the teardown phase (leave the lab running)",
     )
-    parser.add_argument(
+    p.add_argument(
         "--no-validate",
         action="store_true",
         help="Skip the `netlab validate` connectivity check",
     )
-    parser.add_argument(
+    p.add_argument(
         "--up-arg",
         action="append",
         default=[],
         metavar="ARG",
         help="Extra argument passed through to `netlab up` (repeatable)",
     )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-    )
-    return parser
 
 
 def parse_phases(value: Optional[str]) -> Optional[List[str]]:
@@ -94,18 +128,39 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # No subcommand and no -t => default to run.
+    command = args.command
+    if command == "describe":
+        return _cmd_describe(args)
+    # 'run' subcommand or top-level (no subcommand): run the lifecycle.
+    return _cmd_run(args)
+
+
+def _cmd_describe(args) -> int:
     try:
-        phases = parse_phases(args.phase)
-        topology = LabTopology.load(Path(args.topology))
-        if "scenario" not in topology.raw:
-            c.warn("no `scenario:` block found in the topology; running netlab-only lifecycle")
+        topo = LabTopology.load(Path(args.topology))
+    except ScenarioError as ex:
+        c.fail(str(ex))
+        return 2
+    try:
+        print(render_describe(topo, args.format), end="")
+    except ScenarioError as ex:
+        c.fail(str(ex))
+        return 2
+    return 0
+
+
+def _cmd_run(args) -> int:
+    try:
+        phases = parse_phases(getattr(args, "phase", None))
+        topo = LabTopology.load(Path(args.topology))
     except ScenarioError as ex:
         c.fail(str(ex))
         return 2
 
     try:
         cfg = ScenarioConfig(
-            topology=topology,
+            topology=topo,
             provider=args.provider,
             dry_run=args.dry_run,
             keep_lab=args.keep_lab,
@@ -124,7 +179,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         c.fail("interrupted by user")
         return 130
 
-    # Non-zero exit if any recorded phase failed.
     return 0 if all(r.ok for r in runner.results) else 1
 
 

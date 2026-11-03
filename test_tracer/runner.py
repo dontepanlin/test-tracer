@@ -1,14 +1,18 @@
 """
 Scenario lifecycle orchestrator.
 
-Implements the plan's lifecycle:
+Treats *netlab* as the **Topology Provider** (``netlab up``/``down``/
+``validate``) and *Ansible* as the **Test Engine** (playbooks against the
+``hosts.yml`` netlab generates).
 
-    Create -> (TC via netlab up) -> Verify -> Capture + Scripts -> Harvest -> Teardown
+Lifecycle:
 
-Design: this project treats *netlab* as the **Topology Provider** (driving its
-public CLI: ``netlab up``/``down``/``validate``) and *Ansible* as the **Test
-Engine** (running playbooks against the ``hosts.yml`` netlab generates). This
-keeps the two loosely coupled and version-agnostic.
+    create -> verify -> steps -> harvest -> teardown
+
+The **steps** phase is the heart of the timeline: for each step the runner
+starts the captures that step declares, runs the step's actions (with its
+declarative assert), and stops captures that the next step no longer needs.
+Ambient captures (``always_capture``) run for the whole timeline.
 """
 
 import shutil
@@ -17,11 +21,11 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import yaml
 
-from . import console as c
+from . import console as c, daemons
 from .scenario import LabTopology, ScenarioError
 from .playbooks import generate_playbooks
 
@@ -31,7 +35,6 @@ def resolve_netlab() -> str:
     found = shutil.which("netlab")
     if found:
         return found
-    # Fall back to the interpreter's bin dir (e.g. the project venv).
     candidate = Path(sys.executable).parent / "netlab"
     if candidate.exists():
         return str(candidate)
@@ -45,7 +48,7 @@ class ScenarioConfig:
     topology: LabTopology
     provider: Optional[str] = None
     dry_run: bool = False
-    keep_lab: bool = False          # skip teardown
+    keep_lab: bool = False
     no_validate: bool = False
     extra_up_args: List[str] = field(default_factory=list)
     netlab_bin: str = field(default_factory=resolve_netlab)
@@ -82,28 +85,42 @@ class PhaseResult:
     detail: str = ""
 
 
+@dataclass
+class StepResult:
+    name: str
+    ok: bool
+    detail: str = ""
+
+
 class ScenarioRunner:
     """Drives the scenario lifecycle."""
 
     def __init__(self, cfg: ScenarioConfig):
         self.cfg = cfg
         self.results: List[PhaseResult] = []
+        self.step_results: List[StepResult] = []
         self._netlab_bin = cfg.netlab_bin
+        self._generated: dict = {}   # filename -> Path
+        self._active_captures: Set[str] = set()
 
     # ------------------------------------------------------------------ utils
 
     def _run(self, cmd: List[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
-        """Run a command, streaming output to the console.
-
-        In dry-run mode the command is only printed.
-        """
         cwd = cwd or self.cfg.lab_dir
         shown = " ".join(str(x) for x in cmd)
         if self.cfg.dry_run:
             c.info(c.dim(f"[dry-run] $ {shown}"))
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         c.info("$ " + shown)
-        proc = subprocess.run([str(x) for x in cmd], cwd=str(cwd))
+        # Capture output so the caller can inspect it (e.g. to tell a real
+        # `netlab validate` failure apart from "No validation tests defined").
+        proc = subprocess.run([str(x) for x in cmd], cwd=str(cwd),
+                              capture_output=True, text=True)
+        # Echo the captured output so the user still sees netlab/ansible logs.
+        if proc.stdout:
+            sys.stderr.write(proc.stdout if proc.stdout.endswith("\n") else proc.stdout + "\n")
+        if proc.stderr:
+            sys.stderr.write(proc.stderr if proc.stderr.endswith("\n") else proc.stderr + "\n")
         if check and proc.returncode != 0:
             raise ScenarioRunError(f"command failed ({proc.returncode}): {shown}")
         return proc
@@ -111,36 +128,64 @@ class ScenarioRunner:
     def _netlab(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
         return self._run([self._netlab_bin, *args], check=check)
 
-    def _ansible(self, playbook: str, extra: Optional[List[str]] = None,
-                 hosts: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
-        """Run an Ansible playbook against the netlab-generated inventory.
-
-        Runs from the lab directory so netlab's ``ansible.cfg`` and
-        ``hosts.yml`` are picked up automatically.
-        """
+    def _ansible(self, playbook: str, extra_vars: Optional[List[str]] = None,
+                 check: bool = True) -> subprocess.CompletedProcess:
         cmd = ["ansible-playbook", "-i", "hosts.yml", playbook]
-        if hosts:
-            cmd += ["--limit", hosts]
-        if extra:
-            cmd += extra
+        if extra_vars:
+            cmd += extra_vars
         return self._run(cmd, check=check)
 
     def _record(self, phase: str, ok: bool, detail: str = "") -> None:
         self.results.append(PhaseResult(phase, ok, detail))
 
-    def _resolve_playbook(self, name: str) -> Path:
-        """Resolve a playbook path relative to the lab dir (or its playbooks/)."""
-        lab = self.cfg.lab_dir
-        for cand in (lab / name, lab / "playbooks" / name):
-            if cand.exists():
-                return cand
-        raise ScenarioRunError(
-            f"playbook not found: {name} (looked in {lab} and {lab}/playbooks)")
+    def _ensure_playbooks(self) -> None:
+        """Generate (or regenerate) all playbooks for the scenario."""
+        cfg = self.cfg
+        spec = cfg.topology.scenario
+        if "scenario_capture.yml" not in self._generated:
+            self._generated = generate_playbooks(
+                cfg.work_dir, spec.name, spec, cfg.results_dir)
+            c.info(f"generated playbooks in {cfg.work_dir}")
+
+    # ------------------------------------------------------------- capture ctl
+
+    def _capture_file(self) -> Optional[Path]:
+        return self._generated.get("scenario_capture.yml")
+
+    def _start_captures(self, ids: Set[str]) -> None:
+        ids = {i for i in ids if i not in self._active_captures}
+        if not ids:
+            return
+        cmap = self.cfg.topology.scenario.capture_map()
+        for cap_id in sorted(ids):
+            cap = cmap[cap_id]
+            if self.cfg.dry_run:
+                c.info(c.dim(f"[dry-run] docker exec -d {cap.node} tcpdump -i "
+                             f"{cap.interface or ('link:'+str(cap.link))} -> {cap.out_name()}"))
+                continue
+            daemons.start_capture(self.cfg.lab_dir, cap)
+            c.ok(f"started capture {cap_id} on {cap.node} ({cap.out_name()})")
+        self._active_captures |= ids
+
+    def _stop_captures(self, ids: Set[str]) -> None:
+        ids = {i for i in ids if i in self._active_captures}
+        if not ids:
+            return
+        cmap = self.cfg.topology.scenario.capture_map()
+        for cap_id in sorted(ids):
+            cap = cmap[cap_id]
+            if not self.cfg.dry_run:
+                daemons.stop_capture(self.cfg.lab_dir, cap)
+            c.ok(f"stopped capture {cap_id} on {cap.node}")
+        self._active_captures -= ids
+
+    def _stop_all_captures(self) -> None:
+        if self._active_captures:
+            self._stop_captures(set(self._active_captures))
 
     # ----------------------------------------------------------------- phases
 
     def phase_create(self) -> None:
-        """Materialize a normalized topology and start the lab (netlab up)."""
         c.section("1/5", "CREATE — spin up lab & apply traffic control")
         cfg = self.cfg
         topo: LabTopology = cfg.topology
@@ -150,8 +195,6 @@ class ScenarioRunner:
                 "topology does not declare `defaults.attributes.global.scenario`; "
                 "materializing a normalized copy for netlab")
 
-        # Write a normalized topology (guarantees the scenario attribute
-        # declaration) so the user's file stays untouched.
         cfg.normalized_topo_path.write_text(
             yaml.safe_dump(topo.normalized(), sort_keys=False, default_flow_style=False, width=1000))
         c.info(f"normalized topology -> {cfg.normalized_topo_path}")
@@ -167,13 +210,6 @@ class ScenarioRunner:
         self._record("create", True)
 
     def phase_verify(self) -> None:
-        """Validate the lab and wait for convergence.
-
-        If the scenario defines ``verify.ping`` entries, a direct reachability
-        check (ping) is used -- appropriate for plain L2 labs where
-        ``netlab validate`` has no routing tests to run. Otherwise
-        ``netlab validate`` is used.
-        """
         c.section("2/5", "VERIFY — check connectivity")
         cfg = self.cfg
         spec = cfg.topology.scenario
@@ -184,8 +220,10 @@ class ScenarioRunner:
             time.sleep(wait)
 
         if spec.verify_pings:
-            from .playbooks import generate_verify_playbook
-            vfile = generate_verify_playbook(cfg.work_dir, cfg.name, spec.verify_pings)
+            self._ensure_playbooks()
+            vfile = self._generated.get("scenario_verify.yml")
+            if vfile is None:
+                raise ScenarioRunError("verify playbook not generated")
             self._ansible(str(vfile))
             c.ok(f"reachability verified ({len(spec.verify_pings)} ping check(s))")
             self._record("verify", True)
@@ -194,73 +232,146 @@ class ScenarioRunner:
         if cfg.no_validate:
             c.info(c.dim("validate skipped (--no-validate)"))
         else:
-            # netlab validate: exit 1 = failure, exit 3 = warning, else OK
             proc = self._netlab("validate", check=False)
-            if proc.returncode == 1:
+            output = (proc.stdout or "") + (proc.stderr or "")
+            # A plain L2 lab (no routing module) has no `validate` tests, so
+            # netlab exits 1 with "No validation tests defined". That is NOT a
+            # failure — there was simply nothing to validate. Treat it as ok.
+            if "No validation tests defined" in output:
+                c.info(c.dim("netlab validate: no validation tests defined "
+                             "(plain lab) — nothing to check"))
+            elif proc.returncode == 1:
                 c.err("netlab validate reported failures")
                 self._record("verify", False, "netlab validate exit=1")
                 raise ScenarioRunError("validation failed")
-            if proc.returncode == 3:
+            elif proc.returncode == 3:
                 c.warn("netlab validate produced a warning")
         c.ok("lab verified")
         self._record("verify", True)
 
-    def phase_capture(self) -> None:
-        """Start captures, run traffic scripts, stop captures."""
-        c.section("3/5", "CAPTURE + SCRIPTS")
+    def phase_steps(self) -> None:
+        c.section("3/5", "STEPS — run the scenario timeline")
         cfg = self.cfg
-        captures = cfg.topology.scenario.captures
-        scripts = cfg.topology.scenario.scripts
+        spec = cfg.topology.scenario
+        always = set(spec.always_capture)
 
-        # Generate helper playbooks (capture start/stop, fetch).
-        if captures:
-            files = generate_playbooks(cfg.work_dir, cfg.name, captures, results_dir=cfg.results_dir)
-            c.info(f"generated playbooks in {cfg.work_dir}")
-            self._ansible(str(files["scenario_capture_start.yml"]))
-            c.ok(f"started {len(captures)} capture(s)")
+        # Pre-generate all playbooks (capture, per-step, fetch, verify).
+        self._ensure_playbooks()
 
-        # Run user-supplied traffic generators.
-        for i, script in enumerate(scripts, 1):
-            if script.playbook:
-                pb = self._resolve_playbook(script.playbook)
-                c.info(f"[script {i}/{len(scripts)}] ansible-playbook {pb.name}")
-                self._ansible(str(pb), hosts=script.nodes)
-            elif script.command:
-                c.info(f"[script {i}/{len(scripts)}] $ {script.command}")
-                self._run(["bash", "-lc", script.command])
-            if script.wait_after and not cfg.dry_run:
-                c.info(f"waiting {script.wait_after}s...")
-                time.sleep(script.wait_after)
+        # Ambient captures run for the whole timeline.
+        if always:
+            self._start_captures(always)
 
-        if captures:
-            stop = cfg.work_dir / "scenario_capture_stop.yml"
-            if stop.exists():
-                self._ansible(str(stop))
-                c.ok("captures stopped")
-        self._record("capture", True)
+        steps = spec.steps
+        for idx, step in enumerate(steps):
+            needed = set(step.capture)
+            # Start captures this step needs that are not already active.
+            self._start_captures(needed)
+
+            c.section(f"step {idx+1}/{len(steps)}", step.name)
+            if cfg.dry_run:
+                self._describe_step(step, idx, needed)
+
+            try:
+                self._run_step(step, idx)
+                self.step_results.append(StepResult(step.name, True))
+                c.ok(f"step {step.name!r} passed")
+            except ScenarioRunError as ex:
+                self.step_results.append(StepResult(step.name, False, str(ex)))
+                c.err(f"step {step.name!r} failed: {ex}")
+
+            # Stop captures no longer needed by the next step (keep ambient).
+            if idx + 1 < len(steps):
+                next_needed = set(steps[idx + 1].capture)
+                to_stop = (needed | always) - next_needed - always
+                self._stop_captures(to_stop)
+            else:
+                # Last step: stop everything that is not ambient.
+                self._stop_captures((needed | always) - always)
+
+        # Safety: stop any still-active non-ambient captures.
+        self._stop_captures(self._active_captures - always)
+        # Ambient captures are stopped at the very end (before harvest).
+        self._stop_all_captures()
+
+        failed = [s.name for s in self.step_results if not s.ok]
+        self._record(
+            "steps", not failed,
+            f"{len(self.step_results) - len(failed)}/{len(self.step_results)} passed"
+            if self.step_results else "no steps",
+        )
+
+    def _run_step(self, step, idx: int) -> None:
+        """Execute a step's actions in order, then its assert.
+
+        `shell`/`raw`/`playbook`/`command` actions run via a generated
+        per-action ansible playbook (so their stdout is persisted for the
+        assert). `daemon` / `daemon_kill` actions run controller-side via the
+        daemon manager (`docker exec -d`), the only reliable way to keep an
+        in-container process alive (see daemons.py).
+        """
+        cfg = self.cfg
+        for i, action in enumerate(step.do):
+            kind = action.kind
+            label = action.label or action.kind
+            if kind in ("daemon", "daemon_kill"):
+                if cfg.dry_run:
+                    c.info(c.dim(f"  [dry-run] docker exec -d {action.node} {action.daemon or action.daemon_kill}"))
+                elif kind == "daemon":
+                    daemons.start_process(cfg.lab_dir, action.node, action.daemon)
+                    c.ok(f"started daemon on {action.node}: {action.daemon[:60]}")
+                else:
+                    daemons.kill_process(cfg.lab_dir, action.node, action.daemon_kill)
+                    c.ok(f"killed daemon on {action.node}: {action.daemon_kill}")
+                continue
+            # shell / raw / playbook / command -> per-action ansible playbook.
+            pb = self._generated.get(f"scenario_step_{idx}_{step.name}_action_{i}.yml")
+            if pb is None:
+                raise ScenarioRunError(f"action playbook not generated for {step.name}[{i}]")
+            if cfg.dry_run:
+                c.info(c.dim(f"  [dry-run] $ ansible-playbook -i hosts.yml {pb.name}  ({label})"))
+            else:
+                self._ansible(str(pb))
+        # Assert (if any) — runs against the combined stdout of the ansible
+        # actions (persisted to per-action output files by the action plays).
+        if step.assert_:
+            assert_pb = self._generated.get(f"scenario_step_{idx}_{step.name}_assert.yml")
+            if assert_pb is None:
+                raise ScenarioRunError(f"assert playbook not generated for {step.name}")
+            if cfg.dry_run:
+                c.info(c.dim(f"  [dry-run] $ ansible-playbook -i hosts.yml {assert_pb.name}  (assert: {step.assert_})"))
+            else:
+                self._ansible(str(assert_pb))
+
+    def _describe_step(self, step, idx: int, needed: Set[str]) -> None:
+        if needed:
+            c.info(c.dim(f"  capture: {', '.join(sorted(needed))} (active during this step)"))
 
     def phase_harvest(self) -> None:
-        """Fetch PCAP files from the nodes into results/."""
-        c.section("4/5", "HARVEST — fetch PCAPs")
+        c.section("4/5", "HARVEST — fetch PCAPs and logs")
         cfg = self.cfg
-        if not cfg.topology.scenario.captures:
-            c.info(c.dim("no captures defined; nothing to harvest"))
-            self._record("harvest", True, "no captures")
+        spec = cfg.topology.scenario
+        if not spec.captures and not any(s.log for s in spec.steps):
+            c.info(c.dim("nothing to harvest"))
+            self._record("harvest", True, "nothing to fetch")
             return
         if not cfg.dry_run:
             cfg.results_dir.mkdir(parents=True, exist_ok=True)
-        fetch = cfg.work_dir / "scenario_fetch.yml"
-        if fetch.exists():
-            self._ansible(str(fetch), check=False)
-            pcaps = list(cfg.results_dir.glob("*.pcap"))
-            c.ok(f"fetched {len(pcaps)} pcap(s) into {cfg.results_dir}")
-            self._record("harvest", True, f"{len(pcaps)} pcap(s)")
-        else:
+        fetch = self._generated.get("scenario_fetch.yml")
+        if fetch is None:
+            # Regenerate in case the steps phase was skipped (--phase harvest).
+            self._ensure_playbooks()
+            fetch = self._generated.get("scenario_fetch.yml")
+        if fetch is None:
             c.warn("fetch playbook missing; skipping harvest")
             self._record("harvest", False, "no fetch playbook")
+            return
+        self._ansible(str(fetch), check=False)
+        pcaps = list(cfg.results_dir.glob("*.pcap")) if cfg.results_dir.exists() else []
+        c.ok(f"fetched {len(pcaps)} pcap(s) into {cfg.results_dir}")
+        self._record("harvest", True, f"{len(pcaps)} pcap(s)")
 
     def phase_teardown(self) -> None:
-        """Tear down the lab."""
         c.section("5/5", "TEARDOWN")
         cfg = self.cfg
         if cfg.keep_lab:
@@ -271,7 +382,6 @@ class ScenarioRunner:
         if cfg.dry_run:
             down_args += ["--dry-run"]
         self._netlab(*down_args, check=False)
-        # Remove the materialized topology copy.
         if cfg.normalized_topo_path.exists() and not cfg.dry_run:
             cfg.normalized_topo_path.unlink()
         c.ok("lab torn down")
@@ -280,7 +390,7 @@ class ScenarioRunner:
     # -------------------------------------------------------------------- api
 
     def run(self, phases: Optional[List[str]] = None) -> List[PhaseResult]:
-        all_phases = ["create", "verify", "capture", "harvest", "teardown"]
+        all_phases = ["create", "verify", "steps", "harvest", "teardown"]
         phases = phases or all_phases
         for p in phases:
             if p not in all_phases:
@@ -301,13 +411,15 @@ class ScenarioRunner:
         except ScenarioRunError as ex:
             c.err(str(ex))
             failed = True
-        except Exception as ex:  # noqa: BLE001 - report & continue to teardown
+        except Exception as ex:  # noqa: BLE001
             c.err(f"unexpected error in phase '{last_phase}': {ex}")
             failed = True
 
-        # Best-effort teardown on failure: only when this run started the lab
-        # itself (create phase requested). If the user targeted a running lab
-        # (--phase capture,harvest etc.) we must never destroy it.
+        # A failed step is a failure even if no phase raised.
+        if any(not s.ok for s in self.step_results):
+            failed = True
+
+        # Best-effort teardown on failure: only when this run started the lab.
         if (
             failed
             and "create" in phases
@@ -332,6 +444,14 @@ class ScenarioRunner:
             if r.detail:
                 line += f"  {r.detail}"
             print(line)
+        if self.step_results:
+            print("  steps:")
+            for s in self.step_results:
+                mark = "ok " if s.ok else "ERR"
+                line = f"    {mark:<3}  {s.name}"
+                if s.detail:
+                    line += f"  {s.detail}"
+                print(line)
         if self.cfg.dry_run:
             c.info(c.dim("(dry-run: no commands were actually executed)"))
         print()

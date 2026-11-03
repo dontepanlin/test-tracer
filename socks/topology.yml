@@ -2,26 +2,41 @@
 #
 # Two Debian 13 "VMs" (containerlab linux containers) on one L2 segment:
 #
-#   socks-proxy  10.10.0.10   - Dante SOCKS5 server on :1080
+#   socks-proxy  10.10.0.10   - go-socks5-proxy on :1080
 #   socks-client 10.10.0.11   - runs curl through the proxy
 #
 # Containers get outbound Internet via Docker NAT (the proxy therefore has
 # working egress + DNS by default). No systemd runs inside the containers,
-# so the playbooks start danted as a plain background process.
+# so the playbooks start the proxy as a plain background process.
 #
 # Run with:
 #
 #     scenario -t socks/topology.yml
 #
+# Inspect the parsed scenario (LLM-readable timeline):
+#
+#     scenario describe -t socks/topology.yml
+#
 # PCAPs end up in socks/results/.
+#
+# ---------------------------------------------------------------------------
+# SCENARIO MODEL
+#
+# The `scenario:` block defines, in one place:
+#   * `captures:`  - NAMED capture definitions (what + how to capture)
+#   * `steps:`     - the TIMELINE (when to capture + what traffic to run)
+#
+# A capture is active only during the steps that list it in `capture:`.
+# Consecutive steps sharing a capture = one continuous capture. See
+# PLAN-refactor.md for the full design.
+# ---------------------------------------------------------------------------
 
 name: socks
 provider: clab
 defaults:
   device: linux
   group: test-group
-  # Unique lab ID so this lab does not collide with other netlab labs
-  # (one is already running with id 'default').
+  # Unique lab ID so this lab does not collide with other netlab labs.
   multilab.id: socks
   mgmt_base: 192.0.2
   mgmt_prefix: 24
@@ -50,34 +65,127 @@ scenario:
   name: socks5_proxy_test
   results: results
 
+  # Wait for the containers to come up. (Reachability is checked in the
+  # timeline, after the data links are addressed — see the `ping` step —
+  # because on a host without passwordless sudo netlab runs with --no-config
+  # and the data interfaces are addressed by the scenario, not by netlab.)
   verify:
-    - wait: 10   # give the containers a moment to come up
-    # Plain L2 lab (no routing module) => 'netlab validate' has no tests,
-    # so verify reachability directly: address the client LAN interface
-    # (in case netlab's initial config was skipped) and ping the proxy.
-    - ping:
-        node: socks-client
-        self: 10.10.0.11/24
-        target: 10.10.0.10
+    - wait: 10
 
-  # Capture the SOCKS exchange on the client side (handshake + tunneled
-  # traffic to the proxy) and the proxy's outbound traffic to example.com.
-  #
-  # NOTE: the proxy egresses via its mgmt interface (eth0, Docker NAT),
-  # so the outbound capture is on eth0, while the SOCKS exchange is on the
-  # L2 segment (eth1).
-  capture:
-    - node: socks-client
-      interface: eth1
+  # --- HOW to capture (named definitions) -------------------------------
+  # `link: 0` resolves at runtime to the node's first data interface (the
+  # L2 segment, eth1). The proxy egresses via its mgmt interface (eth0,
+  # Docker NAT), so the outbound capture uses an explicit `interface: eth0`.
+  captures:
+    - id: socks_handshake
+      node: socks-client
+      link: 0
       filter: "host 10.10.0.10 and tcp port 1080"
       output: socks5_client.pcap
-    - node: socks-proxy
+    - id: proxy_outbound
+      node: socks-proxy
       interface: eth0
       filter: "tcp port 443"
       output: socks5_proxy_outbound.pcap
 
-  scripts:
-    - playbook: playbooks/setup_proxy.yml
-      wait_after: 3
-    - playbook: playbooks/test_socks.yml
-      wait_after: 5   # let tcpdump flush before captures are stopped
+  # --- WHEN + WHAT (the timeline) ----------------------------------------
+  # Each step is a self-contained test case. Captures are active only during
+  # the steps that list them, so the happy-path capture does NOT include the
+  # negative-test (proxy stopped) traffic.
+  steps:
+    # Address every node's data-link (eth1) from its own hostvars. Required
+    # when netlab runs with --no-config (no passwordless sudo for the
+    # privileged `initial` step); idempotent when the config already ran.
+    # Without this, the proxy's eth1 has no IP and the client can't reach it.
+    # The debian:13 base image has no iproute2, so install it first.
+    - name: address-links
+      do:
+        - node: socks-proxy
+          label: address proxy eth1
+          raw: |
+            command -v ip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq iproute2 >/tmp/iproute.log 2>&1; }
+            ip addr replace {{ hostvars['socks-proxy'].interfaces[0].ipv4 }} dev eth1
+            ip link set dev eth1 up
+            echo addressed
+        - node: socks-client
+          label: address client eth1
+          raw: |
+            command -v ip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq iproute2 >/tmp/iproute.log 2>&1; }
+            ip addr replace {{ hostvars['socks-client'].interfaces[0].ipv4 }} dev eth1
+            ip link set dev eth1 up
+            echo addressed
+      assert: { contains: "addressed" }
+
+    # Reachability check now that both data links are addressed.
+    - name: ping
+      do:
+        - node: socks-client
+          label: ping proxy
+          raw: |
+            command -v ping >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq iputils-ping >/tmp/ping.log 2>&1; }
+            ping -c 3 -W 2 10.10.0.10
+      assert: { rc_eq: 0 }
+
+    - name: bring-up
+      do:
+        # Install + configure the proxy (binary download, eth1 addressing,
+        # iptables source restriction). Does NOT start the daemon.
+        - playbook: playbooks/setup_proxy.yml
+        # Start the proxy as a detached daemon (survives the task; a process
+        # started inside an Ansible task gets killed on session teardown).
+        - node: socks-proxy
+          label: start proxy daemon
+          daemon: /usr/local/bin/go-socks5-proxy --host 10.10.0.10 --port 1080 >>/var/log/go_socks5.log 2>&1
+        # Verify it's actually listening (catches a silent failure).
+        - node: socks-proxy
+          label: verify proxy listening
+          shell: ss -lnt 'sport = :1080' | grep -q LISTEN && echo PROXY_UP || echo PROXY_DOWN
+      assert: { contains: "PROXY_UP" }
+
+    - name: happy-path
+      # Capture the SOCKS handshake (client side) and the proxy's outbound
+      # 443 traffic, active during this step only.
+      capture: [socks_handshake, proxy_outbound]
+      do:
+        - node: socks-client
+          label: curl via proxy
+          shell: |
+            command -v curl >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq curl ca-certificates >/tmp/curl_install.log 2>&1; }
+            curl --verbose --noproxy "" \
+              --proxy socks5h://10.10.0.10:1080 \
+              --connect-timeout 10 --max-time 30 \
+              https://example.com/
+      # The proxied request must succeed with an HTTP 200. The server may
+      # answer over HTTP/1.1 ("HTTP/1.1 200") or HTTP/2 ("HTTP/2 200"), so
+      # match both with a regex.
+      assert: { regex: "HTTP/[12](\\.[0-9]+)? 200" }
+
+    - name: negative
+      do:
+        - node: socks-proxy
+          label: stop proxy daemon
+          daemon_kill: go-socks5-proxy
+        - node: socks-client
+          label: curl with proxy stopped
+          shell: |
+            curl --noproxy "" \
+              --proxy socks5h://10.10.0.10:1080 \
+              --connect-timeout 10 --max-time 30 \
+              https://example.com/ || true
+      # Without the proxy the request must FAIL (no HTTP 200).
+      assert: { not_contains: "HTTP/ 200" }
+
+    - name: restore
+      do:
+        - node: socks-proxy
+          label: restart proxy daemon
+          daemon: /usr/local/bin/go-socks5-proxy --host 10.10.0.10 --port 1080 >>/var/log/go_socks5.log 2>&1
+        - node: socks-proxy
+          label: verify proxy listening
+          shell: ss -lnt 'sport = :1080' | grep -q LISTEN && echo PROXY_UP || echo PROXY_DOWN
+      assert: { contains: "PROXY_UP" }
+      # Also harvest the proxy log for inspection.
+      log:
+        - node: socks-proxy
+          src: /var/log/go_socks5.log
+          output: go_socks5.log

@@ -3,11 +3,15 @@
 # Netlab builds this topology (linux containers for the servers, an EOS
 # router in the middle) and applies native `tc` link impairment on
 # mongo1-router. The `scenario:` block tells the scenario runner what to
-# capture and which traffic playbooks to run.
+# capture and which traffic to run, as a step timeline.
 #
 # Run with:
 #
 #     scenario -t example/topology.yml -p clab
+#
+# Inspect the parsed scenario:
+#
+#     scenario describe -t example/topology.yml
 #
 name: scenario-ex
 provider: clab
@@ -41,24 +45,42 @@ scenario:
   name: mongodb_bittorrent_test
   results: results
 
-  # Wait for routing / BGP to converge before validating and generating traffic
+  # Wait for routing / BGP to converge.
   verify:
     - wait: 30
 
-  capture:
-    - node: mongo1
-      interface: eth1
+  # --- HOW to capture (named definitions) -------------------------------
+  captures:
+    - id: mongo_sync
+      node: mongo1
+      link: 0
       filter: "port 27017"
       output: mongo_sync.pcap
-    - node: bt-seed
-      interface: eth1
+    - id: bittorrent
+      node: bt-seed
+      link: 0
+      filter: "port 6881"
       output: bittorrent.pcap
 
-  # Traffic generators run against the netlab-generated hosts.yml inventory.
-  # Playbooks live in example/playbooks/ and are referenced relative to the
-  # lab directory, or drop your own next to the topology file.
-  scripts:
-    - playbook: mongo_sync.yml
-      wait_after: 10
-    - playbook: seed_torrent.yml
-      wait_after: 10
+  # --- WHEN + WHAT (the timeline) ----------------------------------------
+  steps:
+    # MongoDB replication-style traffic across the tc-impaired link.
+    - name: mongo-sync
+      capture: [mongo_sync]
+      do:
+        - playbook: playbooks/mongo_sync.yml
+      # The traffic generator must report that it started.
+      assert: { contains: "started" }
+
+    # BitTorrent-style seed traffic.
+    - name: bt-seed
+      capture: [bittorrent]
+      do:
+        - playbook: playbooks/seed_torrent.yml
+      assert: { contains: "started" }
+
+    # Let the bounded traffic generators finish so the captures record a
+    # full window before they are stopped at the end of the step.
+    - name: settle
+      do:
+        - command: "sleep 35"

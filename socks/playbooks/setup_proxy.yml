@@ -65,23 +65,11 @@
         mode: '0755'
         timeout: 30
 
-    # REPLACED SYSTEMD WITH THIS BACKGROUND PROCESS MANAGER
-    - name: Ensure go-socks5-proxy is running in the background
-      ansible.builtin.shell: |
-        set -e
-        # Check if the specific process is already running
-        if pgrep -f "{{ proxy_bin }}.*--port {{ proxy_port }}" >/dev/null 2>&1; then
-          echo "ALREADY_RUNNING"
-        else
-          # Clean up any stale/zombie processes first
-          pkill -f "{{ proxy_bin }}" 2>/dev/null || true
-          sleep 1
-          # Start in background, detached from terminal, logging to file
-          nohup {{ proxy_bin }} --host {{ proxy_lan_ip }} --port {{ proxy_port }} >> {{ proxy_log }} 2>&1 &
-          echo "STARTED"
-        fi
-      register: start_result
-      changed_when: "'STARTED' in start_result.stdout"
+    # NOTE: the proxy itself is started by the scenario timeline's `daemon`
+    # action (a `docker exec -d`), not here. This playbook only installs,
+    # downloads, and configures. (A background process started inside an
+    # Ansible task gets killed when the task's docker-exec session ends — see
+    # test_tracer/daemons.py.)
 
     - name: Restrict proxy port to the allowed test client only
       ansible.builtin.iptables:
