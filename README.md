@@ -16,6 +16,29 @@ writes.
 
 Lifecycle: **Create → Verify → Steps → Harvest → Teardown**.
 
+## Work without sudo
+
+1. Add to visudo to sudoers access to net utils
+
+sudo visudo -f /etc/sudoers.d/netns-admin
+```
+user ALL=(root) NOPASSWD: /usr/sbin/ip netns *, /usr/sbin/tc *
+```
+
+2. Add user to docker group
+
+```
+sudo usermod -aG docker 
+```
+
+3. Setup clab to work without sudo
+
+```
+sudo chmod u+s `which containerlab`
+sudo groupadd -r clab_admins
+sudo usermod -aG clab_admins "$USER"
+```
+
 ## Why not Molecule?
 
 Molecule tests Ansible roles against *single* containers; it has no topology
