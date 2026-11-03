@@ -27,15 +27,18 @@
 
   tasks:
     # Bootstrap python3 (needed by Ansible modules) plus curl via `raw`.
-    # modules) plus curl via `raw`.
+    # No -qq: keep the output visible so apt problems are easy to spot.
     - name: Bootstrap python3 and install curl, ca-certificates, procps
-      ansible.builtin.raw: >
-        (apt-get update -qq &&
-         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq
-         python3 curl ca-certificates procps)
-        >/tmp/apt_bootstrap.log 2>&1
+      ansible.builtin.raw: |
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          python3 curl ca-certificates procps
+        rc=$?
+        command -v curl >/dev/null 2>&1 && echo "curl present: $(command -v curl)"
+        exit $rc
       register: apt
       changed_when: apt.rc == 0
+      failed_when: apt.rc != 0
 
     # Ensure the LAN interface has its netlab address (same reasoning as in
     # setup_proxy.yml).
@@ -77,9 +80,20 @@
     - name: Stop go-socks5-proxy on the proxy
       delegate_to: socks-proxy
       ansible.builtin.raw: |
-        pkill -x go-socks5-proxy 2>/dev/null || true
+        # pkill may be absent (procps not installed yet) -> /proc scan fallback
+        if command -v pkill >/dev/null 2>&1; then
+          pkill -x go-socks5-proxy 2>/dev/null || true
+        else
+          for p in /proc/[0-9]*; do
+            [ "$(cat $p/comm 2>/dev/null)" = "go-socks5-proxy" ] && kill "${p#/proc/}" 2>/dev/null
+          done
+        fi
         sleep 1
-        ss -lnt 'sport = :{{ proxy_port }}' | grep -q LISTEN && echo "still listening" || echo "stopped"
+        running=0
+        for p in /proc/[0-9]*; do
+          [ "$(cat $p/comm 2>/dev/null)" = "go-socks5-proxy" ] && running=1
+        done
+        [ $running -eq 0 ] && echo "stopped" || echo "still running"
       register: proxy_stop
       changed_when: "'stopped' in proxy_stop.stdout"
 

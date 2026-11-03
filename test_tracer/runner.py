@@ -167,9 +167,30 @@ class ScenarioRunner:
         self._record("create", True)
 
     def phase_verify(self) -> None:
-        """Validate the lab and wait for convergence."""
+        """Validate the lab and wait for convergence.
+
+        If the scenario defines ``verify.ping`` entries, a direct reachability
+        check (ping) is used -- appropriate for plain L2 labs where
+        ``netlab validate`` has no routing tests to run. Otherwise
+        ``netlab validate`` is used.
+        """
         c.section("2/5", "VERIFY — check connectivity")
         cfg = self.cfg
+        spec = cfg.topology.scenario
+
+        wait = spec.verify_wait
+        if wait and not cfg.dry_run:
+            c.info(f"waiting {wait}s before validation...")
+            time.sleep(wait)
+
+        if spec.verify_pings:
+            from .playbooks import generate_verify_playbook
+            vfile = generate_verify_playbook(cfg.work_dir, cfg.name, spec.verify_pings)
+            self._ansible(str(vfile))
+            c.ok(f"reachability verified ({len(spec.verify_pings)} ping check(s))")
+            self._record("verify", True)
+            return
+
         if cfg.no_validate:
             c.info(c.dim("validate skipped (--no-validate)"))
         else:
@@ -181,10 +202,6 @@ class ScenarioRunner:
                 raise ScenarioRunError("validation failed")
             if proc.returncode == 3:
                 c.warn("netlab validate produced a warning")
-        wait = cfg.topology.scenario.verify_wait
-        if wait and not cfg.dry_run:
-            c.info(f"waiting {wait}s for routing convergence...")
-            time.sleep(wait)
         c.ok("lab verified")
         self._record("verify", True)
 
@@ -197,7 +214,7 @@ class ScenarioRunner:
 
         # Generate helper playbooks (capture start/stop, fetch).
         if captures:
-            files = generate_playbooks(cfg.work_dir, cfg.name, captures)
+            files = generate_playbooks(cfg.work_dir, cfg.name, captures, results_dir=cfg.results_dir)
             c.info(f"generated playbooks in {cfg.work_dir}")
             self._ansible(str(files["scenario_capture_start.yml"]))
             c.ok(f"started {len(captures)} capture(s)")

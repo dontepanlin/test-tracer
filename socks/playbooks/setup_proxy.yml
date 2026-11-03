@@ -5,12 +5,14 @@
   hosts: socks-proxy
   gather_facts: false
   tasks:
+    # NOTE: always run the package install (apt is idempotent). Containers
+    # are ephemeral: after any `netlab up` recreation everything is gone,
+    # and python3 alone does NOT imply the rest of the package set is
+    # present.
     - name: Install python3 and basic networking tools (Debian/Ubuntu or Alpine)
       ansible.builtin.raw: |
         set -e
-        if command -v python3 >/dev/null 2>&1; then
-          echo "ALREADY_INSTALLED"
-        elif command -v apt-get >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 iptables procps net-tools iproute2
           echo "APT_INSTALLED"

@@ -17,7 +17,7 @@ Playbooks:
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -130,9 +130,13 @@ def _capture_stop_playbook(captures: List[CaptureSpec], entries: List[CaptureEnt
             continue  # bounded captures finish on their own
         tasks.append({
             "name": f"stop capture on {cap.node}/{entry.ifname}",
-            "ansible.builtin.shell": (
-                f"kill $(cat /tmp/capture.{entry.ifname}.pid) 2>/dev/null; "
-                f"rm -f /tmp/capture.{entry.ifname}.pid"
+            # Kill by process name via /proc scan (works without procps and
+            # also catches stale tcpdump processes from previous runs that
+            # would otherwise keep writing into the same pcap file).
+            "ansible.builtin.raw": (
+                "for p in /proc/[0-9]*; do "
+                '[ "$(cat $p/comm 2>/dev/null)" = "tcpdump" ] && kill "${p#/proc/}" 2>/dev/null; '
+                "done; rm -f /tmp/capture.*.pid; sleep 1"
             ),
             "ignore_errors": True,
         })
@@ -140,14 +144,16 @@ def _capture_stop_playbook(captures: List[CaptureSpec], entries: List[CaptureEnt
     return _dump(playbook)
 
 
-def _fetch_playbook(captures: List[CaptureSpec]) -> str:
+def _fetch_playbook(captures: List[CaptureSpec], results_dir: Path) -> str:
     tasks = []
     for cap in captures:
         tasks.append({
             "name": f"fetch {cap.out_name()} from {cap.node}",
             "ansible.builtin.fetch": {
                 "src": f"/tmp/{cap.out_name()}",
-                "dest": f"results/{cap.out_name()}",
+                # Absolute path: `fetch` resolves relative dests against the
+                # playbook directory, not the lab directory.
+                "dest": f"{results_dir}/{cap.out_name()}",
                 "flat": True,
             },
             "ignore_errors": True,
@@ -156,14 +162,61 @@ def _fetch_playbook(captures: List[CaptureSpec]) -> str:
     return _dump(playbook)
 
 
-def generate_playbooks(work_dir: Path, name: str, captures: List[CaptureSpec]) -> Dict[str, Path]:
-    """Write generated playbooks into ``work_dir``; return filename -> path."""
+def generate_verify_playbook(work_dir: Path, name: str, pings: List[Dict[str, str]]) -> Path:
+    """Write a reachability-check playbook (one play per ping source node).
+
+    Each play optionally (re)addresses the node's LAN interface (idempotent),
+    ensures ``iputils-ping`` is present, then pings the target. This is the
+    connectivity check for plain L2 labs where ``netlab validate`` has no
+    routing tests to run.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
+    plays = []
+    for p in pings:
+        tasks = []
+        tasks.append({
+            "name": "ensure iproute2 and iputils-ping are installed",
+            "ansible.builtin.raw": (
+                "sh -c '(command -v ip >/dev/null 2>&1 && command -v ping >/dev/null 2>&1) || "
+                "{ apt-get update -qq && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 iputils-ping; }' "
+                ">/tmp/nettools_install.log 2>&1"
+            ),
+            "ignore_errors": True,
+        })
+        if p.get("self"):
+            tasks.append({
+                "name": f"ensure {p['node']} has its LAN address",
+                "ansible.builtin.raw": f"ip addr replace {p['self']} dev eth1 && ip link set dev eth1 up",
+            })
+        tasks.append({
+            "name": f"ping {p['target']} (3 tries)",
+            "ansible.builtin.raw": f"ping -c 3 -W 2 {p['target']}",
+            "register": "pingr",
+            "failed_when": "pingr.rc != 0",
+        })
+        plays.append({"hosts": p["node"], "gather_facts": False, "tasks": tasks})
+    out = work_dir / "scenario_verify.yml"
+    out.write_text(_dump(plays))
+    return out
+
+
+def generate_playbooks(work_dir: Path, name: str, captures: List[CaptureSpec],
+                       results_dir: Optional[Path] = None) -> Dict[str, Path]:
+    """Write generated playbooks into ``work_dir``; return filename -> path.
+
+    ``results_dir`` (absolute) is where fetched PCAPs land; defaults to
+    ``work_dir.parent / "results"``.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    if results_dir is None:
+        results_dir = work_dir.parent / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
     entries = resolve_capture_interfaces(work_dir.parent, captures)
     files = {
         "scenario_capture_start.yml": _capture_start_playbook(captures, entries),
         "scenario_capture_stop.yml": _capture_stop_playbook(captures, entries),
-        "scenario_fetch.yml": _fetch_playbook(captures),
+        "scenario_fetch.yml": _fetch_playbook(captures, results_dir),
     }
     out = {}
     for fname, content in files.items():

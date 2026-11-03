@@ -51,7 +51,14 @@ scenario:
   results: results
 
   verify:
-    - wait: 10   # give the interfaces a moment before validating
+    - wait: 10   # give the containers a moment to come up
+    # Plain L2 lab (no routing module) => 'netlab validate' has no tests,
+    # so verify reachability directly: address the client LAN interface
+    # (in case netlab's initial config was skipped) and ping the proxy.
+    - ping:
+        node: socks-client
+        self: 10.10.0.11/24
+        target: 10.10.0.10
 
   # Capture the SOCKS exchange on the client side (handshake + tunneled
   # traffic to the proxy) and the proxy's outbound traffic to example.com.

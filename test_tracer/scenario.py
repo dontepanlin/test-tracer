@@ -88,6 +88,7 @@ class ScenarioSpec:
     results_dir: str = "results"          # where PCAPs are harvested (relative to lab dir)
     verify_wait: int = 0                  # seconds to wait for routing convergence
     verify: List[Dict[str, Any]] = field(default_factory=list)
+    verify_pings: List[Dict[str, str]] = field(default_factory=list)
     captures: List[CaptureSpec] = field(default_factory=list)
     scripts: List[ScriptSpec] = field(default_factory=list)
     teardown: Dict[str, Any] = field(default_factory=dict)
@@ -106,8 +107,19 @@ class ScenarioSpec:
         if not isinstance(verify, list):
             raise ScenarioError("'scenario.verify' must be a list")
         for entry in verify:
-            if isinstance(entry, dict) and "wait" in entry:
+            if not isinstance(entry, dict):
+                raise ScenarioError(f"'scenario.verify' entries must be mappings: {entry!r}")
+            if "wait" in entry:
                 spec.verify_wait += int(entry["wait"])
+            if "ping" in entry:
+                ping = entry["ping"]
+                if not isinstance(ping, dict) or "node" not in ping or "target" not in ping:
+                    raise ScenarioError(
+                        f"verify.ping must be a mapping with 'node' and 'target': {ping!r}")
+                item = {"node": str(ping["node"]), "target": str(ping["target"])}
+                if "self" in ping:
+                    item["self"] = str(ping["self"])
+                spec.verify_pings.append(item)
             spec.verify.append(entry)
 
         for c in data.get("capture", []) or []:
