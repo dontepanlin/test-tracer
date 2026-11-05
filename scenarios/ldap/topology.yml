@@ -1,0 +1,152 @@
+# LDAP test topology.
+#
+# Two containers on one L2 segment:
+#
+#   ldap-server  10.20.0.10   - osixia/openldap (slapd on :389 and :636)
+#   ldap-client  10.20.0.11   - runs ldapsearch against the server
+#
+# Run with:
+#
+#     uv run scenario -t ldap/topology.yml --up-arg=--no-config
+#
+# PCAPs end up in ldap/results/.
+# ---------------------------------------------------------------------------
+
+name: ldap-test
+provider: clab
+defaults:
+  device: linux
+  group: test-group
+  multilab.id: ldap-test
+  mgmt_base: 192.0.2
+  mgmt_prefix: 24
+  mgmt_mode: static
+  attributes:
+    global:
+      scenario: { type: dict }
+
+nodes:
+  ldap-server:
+    image: osixia/openldap:2.6.15-rc
+    clab:
+      env:
+        OPENLDAP_BOOTSTRAP_ORGANIZATION: "Keycloakers Org"
+        OPENLDAP_BOOTSTRAP_SUFFIX: "dc=keycloakers,dc=org"
+        # osixia 2.6.15 hardcodes slapd to 3890/6360 in
+        # /container/environment/.env (OPENLDAP_URLS); override it so slapd
+        # listens on the standard 389 (LDAP) and 636 (LDAPS) ports.
+        OPENLDAP_URLS: "ldap://:389 ldaps://:636 ldapi:///"
+  ldap-client:
+    image: debian:13
+
+links:
+  - interfaces:
+      - node: ldap-server
+        ipv4: 10.20.0.10/24
+      - node: ldap-client
+        ipv4: 10.20.0.11/24
+    prefix: 10.20.0.0/24
+
+scenario:
+  name: ldap_bind_search_test
+  results: results
+
+  # Wait for the containers to boot. The osixia image takes a few seconds 
+  # to initialize slapd and generate TLS certificates on first run.
+  verify:
+    - wait: 10
+
+  captures:
+    - id: ldap_traffic
+      node: ldap-client
+      link: 0
+      # Capture both standard LDAP and LDAPS ports
+      filter: "host 10.20.0.10 and (tcp port 389 or tcp port 636)"
+      output: ldap_client.pcap
+
+  steps:
+    # Address the data-links (eth1) manually. Required when netlab runs with
+    # --no-config (no passwordless sudo on the host).
+    - name: address-links
+      do:
+        - node: ldap-server
+          label: address server eth1
+          raw: |
+            command -v ip >/dev/null 2>&1 || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 >/tmp/iproute.log 2>&1; }
+            ip addr replace {{ hostvars['ldap-server'].interfaces[0].ipv4 }} dev eth1
+            ip link set dev eth1 up
+            echo addressed
+        - node: ldap-client
+          label: address client eth1
+          raw: |
+            command -v ip >/dev/null 2>&1 || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iproute2 >/tmp/iproute.log 2>&1; }
+            ip addr replace {{ hostvars['ldap-client'].interfaces[0].ipv4 }} dev eth1
+            ip link set dev eth1 up
+            echo addressed
+      assert: { contains: "addressed" }
+
+    # Wait for slapd to initialize.
+    - name: wait-for-ldap
+      do:
+        - node: ldap-client
+          label: install ldap-utils and wait for server
+          raw: |
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ldap-utils libsasl2-modules >/tmp/ldap.log 2>&1
+            for i in {1..30}; do
+              # Anonymous base-level search to check if slapd is responsive
+              ldapsearch -x -H ldap://10.20.0.10:389 -b "" -s base namingContexts >/dev/null 2>&1 && echo "LDAP_READY" && exit 0
+              sleep 2
+            done
+            echo "LDAP_TIMEOUT"
+            exit 1
+      assert: { contains: "LDAP_READY" }
+
+    # Collect the auto-generated DB root password from the server's container
+    # logs. Each scenario action runs in its own ansible-playbook invocation,
+    # so the fact set in the collect playbook does not survive to the next
+    # step; the playbook therefore persists the password to
+    # <lab-dir>/vars/generated_root_password and the steps below read it back
+    # with lookup('file', inventory_dir + '/vars/generated_root_password').
+    - name: collect-password
+      do:
+        - label: collect generated root password
+          playbook: playbooks/collect_password.yml
+      assert: { contains: "failed=0" }
+
+    # 1. Simple bind over plain LDAP (port 389) - baseline plaintext traffic
+    - name: simple-bind-search
+      capture: [ldap_traffic]
+      do:
+        - node: ldap-client
+          label: simple bind and search
+          shell: |
+            ldapsearch -x -H ldap://10.20.0.10:389 \
+              -D "cn=admin,dc=keycloakers,dc=org" -w "{{ lookup('file', inventory_dir + '/vars/generated_root_password') }}" \
+              -b "dc=keycloakers,dc=org" "(objectClass=*)"
+      assert: { contains: "dn: dc=keycloakers,dc=org" }
+
+    # # 2. StartTLS over plain LDAP (port 389) - secure alternative to SASL
+    # - name: starttls-search
+    #   capture: [ldap_traffic]
+    #   do:
+    #     - node: ldap-client
+    #       label: starttls bind and search
+    #       shell: |
+    #         # StartTLS upgrades the plain connection to TLS.
+    #         # tls_reqcert=never is required because osixia generates a self-signed cert.
+    #         ldapsearch -x -Z -o tls_reqcert=never -H ldap://10.20.0.10:389 \
+    #           -D "cn=admin,dc=keycloakers,dc=org" -w "{{ lookup('file', inventory_dir + '/vars/generated_root_password') }}" \
+    #           -b "dc=keycloakers,dc=org" "(objectClass=*)"
+    #   assert: { contains: "dn: dc=keycloakers,dc=org" }
+
+    # # 3. LDAPS (port 636) - native encrypted LDAP
+    # - name: ldaps-search
+    #   capture: [ldap_traffic]
+    #   do:
+    #     - node: ldap-client
+    #       label: ldaps bind and search
+    #       shell: |
+    #         ldapsearch -x -H ldaps://10.20.0.10:636 -o tls_reqcert=never \
+    #           -D "cn=admin,dc=keycloakers,dc=org" -w "{{ lookup('file', inventory_dir + '/vars/generated_root_password') }}" \
+    #           -b "dc=keycloakers,dc=org" "(objectClass=*)"
+    #   assert: { contains: "dn: dc=keycloakers,dc=org" }

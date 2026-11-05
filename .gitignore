@@ -26,5 +26,8 @@ downloaded.yml
 results/
 scenario-*/
 
+# runtime vars written by playbooks (e.g. generated root password)
+vars/
+
 # scratch
 tmp-test/
